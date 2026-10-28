@@ -1,0 +1,804 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no" />
+<meta name="theme-color" content="#000000" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<title>AI 构图引导</title>
+<style>
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  html,body{height:100%;margin:0;background:#000;color:#fff;overflow:hidden;
+    font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif}
+  #stage{position:fixed;inset:0;background:#000}
+  #overlay{position:absolute;left:0;top:0;display:block;touch-action:none}
+  /* 视频只作为解码源，画面统一由 canvas 合成，避免坐标对不齐 */
+  #video{position:fixed;left:0;top:0;width:8px;height:8px;opacity:.01;pointer-events:none}
+
+  #chips{position:fixed;top:calc(env(safe-area-inset-top,0px) + 8px);left:0;right:0;z-index:5;
+    display:flex;gap:6px;justify-content:center;flex-wrap:wrap;padding:0 10px}
+  .group{display:flex;background:rgba(0,0,0,.45);border-radius:999px;padding:3px;
+    backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px)}
+  .group button{border:0;background:transparent;color:#cfcfcf;font-size:13px;
+    padding:6px 12px;border-radius:999px;font-weight:500;font-family:inherit}
+  .group button.on{background:#fff;color:#000}
+
+  #hud{position:fixed;left:0;right:0;z-index:5;pointer-events:none;text-align:center;
+    bottom:calc(env(safe-area-inset-bottom,0px) + 18px);padding:0 16px}
+  #hint{font-size:clamp(21px,6.6vw,38px);font-weight:700;letter-spacing:.02em;
+    text-shadow:0 2px 14px rgba(0,0,0,.85);line-height:1.25;transition:color .15s}
+  #hint.ok{color:#4ade80}
+  #meta{margin-top:8px;font-size:13px;color:#c8c8c8;font-variant-numeric:tabular-nums}
+  #score{font-weight:700;color:#eee;margin-right:12px}
+  #bar{margin:9px auto 0;width:min(280px,68vw);height:4px;border-radius:2px;
+    background:rgba(255,255,255,.16);overflow:hidden}
+  #bar i{display:block;height:100%;width:0;background:#4ade80;transition:width .12s linear}
+
+  #start{position:fixed;inset:0;z-index:10;display:flex;flex-direction:column;
+    align-items:center;justify-content:center;gap:14px;background:#0a0a0a;
+    text-align:center;padding:28px}
+  #start h1{font-size:26px;margin:0;font-weight:800;letter-spacing:.04em}
+  #start p{color:#9a9a9a;font-size:14px;line-height:1.65;margin:0;max-width:32em}
+  #go{margin-top:10px;background:#fff;color:#000;border:0;border-radius:999px;
+    font-size:17px;font-weight:700;padding:14px 42px;font-family:inherit}
+  #go:disabled{opacity:.45}
+  #pick{margin-top:0;background:transparent;color:#ddd;border:1px solid #444;
+    font-size:15px;font-weight:600;padding:12px 28px}
+  #msg{color:#f87171 !important;font-size:13px;white-space:pre-wrap;max-width:34em}
+  #toast{position:fixed;left:50%;transform:translateX(-50%);z-index:9;
+    bottom:calc(env(safe-area-inset-bottom,0px) + 130px);
+    background:rgba(0,0,0,.78);color:#fbbf24;font-size:13px;padding:8px 14px;
+    border-radius:999px;opacity:0;transition:opacity .3s;pointer-events:none;max-width:88vw}
+  #toast.on{opacity:1}
+  .hide{display:none !important}
+
+  #diagBox{position:fixed;inset:0;z-index:20;background:rgba(0,0,0,.84);
+    display:flex;align-items:center;justify-content:center;padding:16px}
+  .diagInner{background:#151515;border:1px solid #333;border-radius:14px;
+    width:min(560px,100%);max-height:84vh;display:flex;flex-direction:column;padding:16px}
+  .diagInner h2{font-size:16px;margin:0 0 10px;font-weight:700}
+  #diagOut{margin:0;flex:1;overflow:auto;font-size:12px;line-height:1.65;color:#cfcfcf;
+    white-space:pre-wrap;word-break:break-all;
+    font-family:ui-monospace,Consolas,"Courier New",monospace}
+  .diagInner .row{display:flex;gap:10px;margin-top:12px}
+  .diagInner button{flex:1;border:0;border-radius:10px;padding:11px;font-size:14px;
+    font-weight:600;font-family:inherit;background:#2a2a2a;color:#fff}
+  #diagClose{background:#fff;color:#000}
+</style>
+</head>
+<body>
+
+<div id="stage"><canvas id="overlay"></canvas></div>
+<video id="video" playsinline muted autoplay></video>
+
+<header id="chips">
+  <div class="group" id="presetGroup">
+    <button data-preset="portrait" class="on">人像</button>
+    <button data-preset="landscape">风光</button>
+    <button data-preset="center">居中</button>
+  </div>
+  <div class="group" id="modeGroup">
+    <button data-mode="camera" class="on">移动相机</button>
+    <button data-mode="subject">人物移动</button>
+  </div>
+  <div class="group"><button id="flip" title="切换前后摄像头">⇄</button></div>
+  <div class="group"><button id="diag" title="诊断">?</button></div>
+</header>
+
+<div id="hud">
+  <div id="hint">—</div>
+  <div id="meta"><span id="score">--</span><span id="fps"></span><span id="cam"></span></div>
+  <div id="bar"><i></i></div>
+</div>
+
+<div id="toast"></div>
+
+<div id="diagBox" class="hide">
+  <div class="diagInner">
+    <h2>诊断信息</h2>
+    <pre id="diagOut"></pre>
+    <div class="row">
+      <button id="diagCopy">复制</button>
+      <button id="diagClose">关闭</button>
+    </div>
+  </div>
+</div>
+
+<div id="start">
+  <h1>AI 构图引导</h1>
+  <p>把人和景物放到合适的位置，屏幕上会告诉你该往哪动。<br>
+     镜头对准主体 → 绿框出现 → 按提示移动。</p>
+  <button id="go">打开相机</button>
+  <button id="pick" class="ghost">选本地图片 / 视频</button>
+  <input id="file" type="file" accept="image/*,video/*" class="hide" />
+  <p id="msg"></p>
+</div>
+
+<script type="module">
+/* =========================================================
+   AI 构图引导 —— 手机浏览器版
+   算法与 MATLAB 版 framingGuide.m 一致：
+   检测主体 → 最近构图点 → 位置/尺寸误差 → 平滑 + 死区 + 迟滞
+   → 生成动作提示 → 0~100 分
+   ========================================================= */
+
+const MODEL = new URLSearchParams(location.search).get('model') ||
+  'https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite';
+
+// MediaPipe 的 JS + wasm 放多个镜像轮流试。
+// cdn.jsdelivr.net 在国内经常连不上，所以 fastly / unpkg / npmmirror 排在前面。
+const MPV = '0.10.14';
+const CDNS = [
+  { name: 'fastly-jsdelivr', base: `https://fastly.jsdelivr.net/npm/@mediapipe/tasks-vision@${MPV}` },
+  { name: 'unpkg',           base: `https://unpkg.com/@mediapipe/tasks-vision@${MPV}` },
+  { name: 'npmmirror',       base: `https://registry.npmmirror.com/@mediapipe/tasks-vision/${MPV}/files` },
+  { name: 'jsdelivr',        base: `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MPV}` },
+];
+
+// 构图点与主体尺寸区间（归一化 0~1）
+const CFG = {
+  portrait:  { px:[1/3, 2/3], py:[0.38],     size:[0.22, 0.45] }, // 人像：面部中心
+  landscape: { px:[1/3, 2/3], py:[1/3, 2/3], size:[0.05, 0.18] }, // 风光：四个三分点
+  center:    { px:[0.50],     py:[0.48],     size:[0.20, 0.50] }, // 居中对称
+};
+
+const DEAD  = 0.04;   // 死区：画面比例的 4%
+const ALPHA = 0.30;   // 指数平滑系数
+
+const video  = document.getElementById('video');
+const canvas = document.getElementById('overlay');
+const ctx    = canvas.getContext('2d', { alpha: false });
+
+const S = {
+  preset:'portrait', mode:'camera', facing:'environment',
+  detector:null, stream:null, running:false,
+  bbox:null, tx:0.5, ty:0.5, has:false, active:false,
+  sx:0, sy:0, sz:0, init:false, cnt:0, score:NaN, fps:0,
+  lastError:'',
+  srcEl:null, still:false,
+  modelState:'idle', detectorLog:'',
+  manual:null, drag:null,
+};
+
+// 当前画面源的像素尺寸（摄像头 / 视频 / 图片通用）
+function srcSize(){
+  const el = S.srcEl;
+  if (!el) return [0, 0];
+  return [ el.videoWidth || el.naturalWidth || el.width  || 0,
+           el.videoHeight || el.naturalHeight || el.height || 0 ];
+}
+
+/* ---------------- 布局：canvas 内部分辨率 = 视频分辨率 ---------------- */
+function layout(){
+  const [vw, vh] = srcSize();
+  if (!vw || !vh) return;
+  if (canvas.width !== vw || canvas.height !== vh){
+    canvas.width = vw; canvas.height = vh;
+  }
+  const W = window.innerWidth, H = window.innerHeight;
+  const s = Math.min(W / vw, H / vh);
+  const w = Math.round(vw * s), h = Math.round(vh * s);
+  canvas.style.width  = w + 'px';
+  canvas.style.height = h + 'px';
+  canvas.style.left   = Math.round((W - w) / 2) + 'px';
+  canvas.style.top    = Math.round((H - h) / 2) + 'px';
+}
+window.addEventListener('resize', layout);
+window.addEventListener('orientationchange', () => setTimeout(layout, 300));
+video.addEventListener('loadedmetadata', layout);
+video.addEventListener('playing', layout);
+
+/* ---------------- 相机 ---------------- */
+function stopStream(){
+  if (S.stream){
+    S.stream.getTracks().forEach(t => t.stop());
+    S.stream = null;
+  }
+  video.srcObject = null;
+}
+
+// 授权成功 ≠ 有画面。等第一帧真的出来，否则给明确错误。
+function waitFirstFrame(ms){
+  return new Promise((resolve, reject) => {
+    if (video.readyState >= 2 && video.videoWidth) return resolve();
+    let done = false;
+    const finish = (err) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      err ? reject(err) : resolve();
+    };
+    const timer = setTimeout(() => finish(new Error(
+      '相机已授权，但 4 秒内没有画面。通常是摄像头被其它程序占用（微信/钉钉/Teams 最常见），或者驱动异常。')),
+      ms);
+    video.addEventListener('loadeddata', () => finish(), { once: true });
+    video.addEventListener('playing',    () => finish(), { once: true });
+    video.play().catch(() => {});
+  });
+}
+
+async function startCamera(){
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
+    throw new Error('当前页面不是安全上下文：浏览器禁止在 http 页面调用相机。\n' +
+                    '请用 https 打开，或在本机用 http://localhost 打开。');
+  }
+  stopStream();
+
+  // 从最精确到最宽松依次尝试，避免 OverconstrainedError 一上来就失败
+  const tries = [
+    { audio: false, video: { facingMode: { ideal: S.facing }, width: { ideal: 1280 }, height: { ideal: 720 } } },
+    { audio: false, video: { facingMode: { ideal: S.facing } } },
+    { audio: false, video: true },
+  ];
+
+  let lastErr = null;
+  for (const c of tries){
+    try {
+      S.stream = await navigator.mediaDevices.getUserMedia(c);
+      lastErr = null;
+      break;
+    } catch (e){
+      lastErr = e;
+      if (e.name === 'NotAllowedError' || e.name === 'SecurityError') break;
+    }
+  }
+  if (!S.stream) throw lastErr || new Error('没有可用的摄像头');
+
+  video.srcObject = S.stream;
+  await waitFirstFrame(4000);
+  S.srcEl = video;
+  S.still = false;
+  layout();
+}
+
+/* ---------------- 人脸检测器 ---------------- */
+// 依次试每个镜像：先加载 ESM 模块，再用同一镜像的 wasm 初始化。
+// 每一步失败都记进 S.detectorLog，诊断面板里能看到到底卡在哪。
+async function initDetector(){
+  const log = [];
+  for (const c of CDNS){
+    let mod;
+    try {
+      mod = await import(c.base + '/vision_bundle.mjs');
+    } catch (e){
+      log.push(c.name + ' · JS 加载失败: ' + (e.message || e));
+      continue;
+    }
+    if (!mod || !mod.FaceDetector || !mod.FilesetResolver){
+      log.push(c.name + ' · 模块里没有 FaceDetector');
+      continue;
+    }
+
+    let fileset;
+    try {
+      fileset = await mod.FilesetResolver.forVisionTasks(c.base + '/wasm');
+    } catch (e){
+      log.push(c.name + ' · wasm 初始化失败: ' + (e.message || e));
+      continue;
+    }
+
+    for (const delegate of ['GPU', 'CPU']){
+      try {
+        const det = await mod.FaceDetector.createFromOptions(fileset, {
+          baseOptions: { modelAssetPath: MODEL, delegate },
+          runningMode: 'VIDEO',
+          minDetectionConfidence: 0.5,
+        });
+        S.detectorLog = log.concat([c.name + ' · 成功（' + delegate + '）']).join('\n');
+        return det;
+      } catch (e){
+        log.push(c.name + ' · ' + delegate + ' 初始化失败: ' + (e.message || e));
+      }
+    }
+  }
+  S.detectorLog = log.join('\n') || '没有可用的镜像';
+  throw new Error('所有镜像都失败了');
+}
+
+/* ---------------- 主循环 ---------------- */
+let lastT = performance.now();
+
+function loop(){
+  if (!S.running) return;
+  requestAnimationFrame(loop);
+
+  const now = performance.now();
+  const dt  = now - lastT;
+  lastT = now;
+  if (dt > 0) S.fps = S.fps ? S.fps * 0.9 + (1000 / dt) * 0.1 : 1000 / dt;
+
+  if (!srcSize()[0]) return;
+  if (!canvas.width || !canvas.height) layout();
+
+  paint();
+
+  let dets = [];
+  if (S.detector){
+    try {
+      const r = S.detector.detectForVideo(S.srcEl, now);
+      dets = r.detections || [];
+    } catch (e) { /* 时间戳冲突或帧未就绪，跳过这一帧 */ }
+  }
+
+  update(dets);
+  overlay();
+  hud();
+}
+
+/* ---------------- 构图计算 ---------------- */
+function update(dets){
+  // 取面积最大的检测框
+  let box = null;
+  for (const d of dets){
+    const b = d.boundingBox;
+    if (!b) continue;
+    if (!box || b.width * b.height > box.w * box.h){
+      box = { x:b.originX, y:b.originY, w:b.width, h:b.height };
+    }
+  }
+  if (!box && S.manual) box = S.manual;   // 没有模型时用手框的主体
+  applyBox(box);
+}
+
+function applyBox(box){
+  const W = canvas.width, H = canvas.height;
+  if (!W || !H) return;
+  S.bbox = box;
+
+  const cfg = CFG[S.preset];
+  let ex = 0, ey = 0, es = 0, tx = 0.5, ty = 0.5;
+  const has = !!box;
+
+  if (has){
+    const cx = (box.x + box.w / 2) / W;
+    const cy = (box.y + box.h / 2) / H;
+
+    // 最近的构图点
+    let best = Infinity;
+    for (const px of cfg.px){
+      for (const py of cfg.py){
+        const dd = (px - cx) ** 2 + (py - cy) ** 2;
+        if (dd < best){ best = dd; tx = px; ty = py; }
+      }
+    }
+    ex = tx - cx;                 // >0：主体需要向右移
+    ey = ty - cy;                 // >0：主体需要向下移
+
+    // 主体尺寸偏差：负=太小，正=太大
+    const r = box.h / H;
+    const [lo, hi] = cfg.size;
+    es = r < lo ? (r - lo) / lo : (r > hi ? (r - hi) / hi : 0);
+  }
+
+  // 指数平滑
+  if (!has){
+    S.sx *= 0.7; S.sy *= 0.7; S.sz *= 0.7;
+  } else if (!S.init){
+    S.sx = ex; S.sy = ey; S.sz = es; S.init = true;
+  } else {
+    S.sx = ALPHA * ex + (1 - ALPHA) * S.sx;
+    S.sy = ALPHA * ey + (1 - ALPHA) * S.sy;
+    S.sz = ALPHA * es + (1 - ALPHA) * S.sz;
+  }
+
+  // 迟滞：连续 2 帧超死区才提示
+  const need = Math.hypot(S.sx, S.sy) > DEAD || Math.abs(S.sz) > 0.12;
+  S.cnt = need ? Math.min(S.cnt + 1, 8) : Math.max(S.cnt - 1, 0);
+
+  const pos = Math.max(0, 1 - Math.hypot(S.sx, S.sy) / 0.30);
+  const siz = Math.max(0, 1 - Math.min(1, Math.abs(S.sz)));
+
+  S.has    = has;
+  S.active = has && S.cnt >= 2;
+  S.tx = tx; S.ty = ty;
+  S.score  = has ? Math.round(100 * (0.55 * pos + 0.30 * siz + 0.15)) : NaN;
+}
+
+/* ---------------- 绘制 ---------------- */
+function paint(){
+  const W = canvas.width, H = canvas.height;
+  if (!W || !H || !S.srcEl) return;
+  try { ctx.drawImage(S.srcEl, 0, 0, W, H); } catch (e) { /* 首帧未就绪 */ }
+}
+
+function overlay(){
+  const W = canvas.width, H = canvas.height;
+  if (!W || !H) return;
+
+  const u = Math.max(1, H / 900);
+
+  // 三分线
+  ctx.strokeStyle = 'rgba(255,240,150,.38)';
+  ctx.lineWidth = 1.2 * u;
+  for (let i = 1; i < 3; i++){
+    ctx.beginPath(); ctx.moveTo(W * i / 3, 0); ctx.lineTo(W * i / 3, H); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(0, H * i / 3); ctx.lineTo(W, H * i / 3); ctx.stroke();
+  }
+
+  const b = S.bbox;
+  if (b){
+    // 主体框
+    ctx.strokeStyle = 'rgba(74,222,128,.95)';
+    ctx.lineWidth = 2.4 * u;
+    ctx.strokeRect(b.x, b.y, b.w, b.h);
+
+    // 目标点
+    const tx = S.tx * W, ty = S.ty * H;
+    ctx.strokeStyle = 'rgba(251,146,60,.95)';
+    ctx.lineWidth = 2 * u;
+    ctx.beginPath(); ctx.arc(tx, ty, 8 * u, 0, Math.PI * 2); ctx.stroke();
+    ctx.fillStyle = 'rgba(251,146,60,.95)';
+    ctx.beginPath(); ctx.arc(tx, ty, 2.5 * u, 0, Math.PI * 2); ctx.fill();
+
+    // 指向目标点的虚线
+    if (S.active){
+      const cx = b.x + b.w / 2, cy = b.y + b.h / 2;
+      ctx.save();
+      ctx.setLineDash([9 * u, 8 * u]);
+      ctx.strokeStyle = 'rgba(251,146,60,.85)';
+      ctx.lineWidth = 2 * u;
+      ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(tx, ty); ctx.stroke();
+      ctx.restore();
+    }
+  }
+
+  // 正在拖拽的手选框
+  if (S.drag){
+    ctx.save();
+    ctx.setLineDash([7 * u, 6 * u]);
+    ctx.strokeStyle = 'rgba(255,255,255,.92)';
+    ctx.lineWidth = 2 * u;
+    ctx.strokeRect(S.drag.x, S.drag.y, S.drag.w, S.drag.h);
+    ctx.restore();
+  }
+
+  // 画面边框：分数越高越绿
+  if (!isNaN(S.score)){
+    ctx.strokeStyle = S.score >= 80 ? 'rgba(74,222,128,.9)'
+                    : S.score >= 60 ? 'rgba(250,204,21,.85)'
+                    :                 'rgba(248,113,113,.85)';
+    ctx.lineWidth = 6 * u;
+    ctx.strokeRect(3 * u, 3 * u, W - 6 * u, H - 6 * u);
+  }
+}
+
+/* ---------------- 文字提示 ---------------- */
+const hintEl  = document.getElementById('hint');
+const scoreEl = document.getElementById('score');
+const fpsEl   = document.getElementById('fps');
+const camEl   = document.getElementById('cam');
+const barEl   = document.querySelector('#bar i');
+
+function hud(){
+  let txt, ok = false;
+
+  if (S.modelState !== 'ready' && !S.has){
+    txt = S.modelState === 'loading' ? '检测模型加载中…' : '拖一个框圈住主体';
+  } else if (!S.has){
+    txt = '未检测到主体';
+  } else if (!S.active){
+    txt = '构图 OK';
+    ok = true;
+  } else {
+    const parts = [];
+    const dx = S.sx, dy = S.sy;
+    const cam = S.mode === 'camera';
+
+    if (Math.abs(dx) > DEAD){
+      parts.push((cam ? (dx > 0 ? '相机左移' : '相机右移')
+                      : (dx > 0 ? '向右移动' : '向左移动'))
+                 + ' ' + Math.round(Math.abs(dx) * 100) + '%');
+    }
+    if (Math.abs(dy) > DEAD){
+      parts.push((cam ? (dy > 0 ? '镜头抬高' : '镜头降低')
+                      : (dy > 0 ? '向下移动' : '向上移动'))
+                 + ' ' + Math.round(Math.abs(dy) * 100) + '%');
+    }
+    if (Math.abs(S.sz) > 0.12){
+      parts.push(S.sz < 0 ? '靠近一点' : '退后一点');
+    }
+    txt = (parts.length ? dirIcon() + ' ' : '') + parts.join(' · ');
+  }
+
+  if (txt !== hintEl.textContent) hintEl.textContent = txt;
+  hintEl.classList.toggle('ok', ok);
+  hintEl.style.color = ok ? '' : (S.detector && S.has ? '#fff' : '#c9c9c9');
+
+  const sc = isNaN(S.score) ? '--' : String(S.score);
+  if (scoreEl.textContent !== sc) scoreEl.textContent = 'SCORE ' + sc;
+  fpsEl.textContent = S.still ? '' : Math.round(S.fps) + ' FPS';
+
+  const [sw, sh] = srcSize();
+  const kind = !sw ? '未加载画面' : (S.srcEl === video ? '相机' : (S.still ? '图片' : '视频'));
+  const camTxt = sw ? `${kind} ${sw}×${sh}` : kind;
+  if (camEl.textContent !== camTxt) camEl.textContent = camTxt;
+  barEl.style.width = (isNaN(S.score) ? 0 : S.score) + '%';
+  barEl.style.background = S.score >= 80 ? '#4ade80'
+                         : S.score >= 60 ? '#facc15' : '#f87171';
+}
+
+function dirIcon(){
+  const ax = Math.abs(S.sx), ay = Math.abs(S.sy);
+  if (Math.max(ax, ay) <= DEAD) return '';
+  const cam = S.mode === 'camera';
+  if (ax >= ay){
+    const right = S.sx > 0;
+    return (right === !cam) ? '▶' : '◀';
+  } else {
+    const down = S.sy > 0;
+    return (down === !cam) ? '▼' : '▲';
+  }
+}
+
+/* ---------------- UI 交互 ---------------- */
+function pick(groupId, attr, value){
+  for (const b of document.querySelectorAll('#' + groupId + ' button')){
+    b.classList.toggle('on', b.dataset[attr] === value);
+  }
+}
+document.getElementById('presetGroup').addEventListener('click', (e) => {
+  const b = e.target.closest('button'); if (!b) return;
+  S.preset = b.dataset.preset; pick('presetGroup', 'preset', S.preset); S.init = false;
+});
+document.getElementById('modeGroup').addEventListener('click', (e) => {
+  const b = e.target.closest('button'); if (!b) return;
+  S.mode = b.dataset.mode; pick('modeGroup', 'mode', S.mode);
+});
+document.getElementById('flip').addEventListener('click', async () => {
+  S.facing = S.facing === 'environment' ? 'user' : 'environment';
+  try { await startCamera(); toast('已切换摄像头'); }
+  catch (err){ toast('切换失败：' + explain(err)); }
+});
+
+function toast(msg){
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.classList.add('on');
+  clearTimeout(toast._t);
+  toast._t = setTimeout(() => t.classList.remove('on'), 2600);
+}
+
+function explain(err){
+  const n = (err && err.name) || '';
+  if (n === 'NotAllowedError')   return '相机权限被拒绝。请到浏览器设置里允许本站使用相机，然后刷新页面。';
+  if (n === 'NotFoundError')     return '没有找到可用的摄像头。\n台式机没装摄像头、或 USB 摄像头没插好就会这样——点下面的「选本地图片 / 视频」可以先看效果。';
+  if (n === 'NotReadableError')  return '摄像头被其他应用占用了，先关掉其它用相机的 App 再试。';
+  if (n === 'OverconstrainedError') return '当前摄像头不支持请求的分辨率。';
+  return (err && err.message) || String(err);
+}
+
+/* ---------------- 启动 ---------------- */
+const goBtn  = document.getElementById('go');
+const msgEl  = document.getElementById('msg');
+const startEl = document.getElementById('start');
+
+goBtn.addEventListener('click', async () => {
+  goBtn.disabled = true;
+  goBtn.textContent = '正在启动…';
+  msgEl.textContent = '';
+
+  try {
+    await startCamera();
+    layout();
+    startEl.classList.add('hide');
+
+    S.running = true;
+    lastT = performance.now();
+    requestAnimationFrame(loop);
+
+    ensureDetector();
+  } catch (err){
+    S.lastError = (err && err.name ? err.name + ': ' : '') + ((err && err.message) || String(err));
+    goBtn.disabled = false;
+    goBtn.textContent = '重试';
+    msgEl.textContent = explain(err);
+    console.error(err);
+  }
+});
+
+/* ---------------- 本地图片 / 视频（没摄像头也能用） ---------------- */
+const fileInput = document.getElementById('file');
+
+async function ensureDetector(){
+  if (S.detector) return S.detector;
+  if (S.modelState === 'loading') return null;
+  S.modelState = 'loading';
+  try {
+    S.detector = await initDetector();
+    S.modelState = 'ready';
+    toast('检测模型已就绪');
+  } catch (e){
+    S.modelState = 'failed';
+    console.warn(e);
+    toast('检测模型加载失败 —— 在画面上拖一个框圈住主体，一样能算');
+  }
+  return S.detector;
+}
+
+/* ---------------- 手动框选主体（模型不可用时的兜底） ---------------- */
+let dragStart = null;
+
+function toCanvasPt(e){
+  const r = canvas.getBoundingClientRect();
+  return {
+    x: (e.clientX - r.left) * canvas.width  / r.width,
+    y: (e.clientY - r.top ) * canvas.height / r.height,
+  };
+}
+function boxBetween(a, b){
+  return { x: Math.min(a.x, b.x), y: Math.min(a.y, b.y),
+           w: Math.abs(a.x - b.x), h: Math.abs(a.y - b.y) };
+}
+
+canvas.addEventListener('pointerdown', (e) => {
+  if (S.modelState === 'ready' && S.has) return;   // 已经有框了，别抢手势
+  dragStart = toCanvasPt(e);
+  S.drag = { x: dragStart.x, y: dragStart.y, w: 0, h: 0 };
+  try { canvas.setPointerCapture(e.pointerId); } catch (err) {}
+});
+
+canvas.addEventListener('pointermove', (e) => {
+  if (!dragStart) return;
+  S.drag = boxBetween(dragStart, toCanvasPt(e));
+  paint(); overlay();
+});
+
+canvas.addEventListener('pointerup', (e) => {
+  if (!dragStart) return;
+  const b = boxBetween(dragStart, toCanvasPt(e));
+  dragStart = null;
+  S.drag = null;
+  try { canvas.releasePointerCapture(e.pointerId); } catch (err) {}
+
+  paint();
+  if (b.w > 10 && b.h > 10){
+    S.manual = b;
+    S.init = false;
+    applyBox(b);
+  } else {
+    S.manual = null;
+    applyBox(null);
+  }
+  overlay(); hud();
+});
+
+document.getElementById('pick').addEventListener('click', () => fileInput.click());
+
+fileInput.addEventListener('change', () => {
+  const f = fileInput.files && fileInput.files[0];
+  if (f) openMedia(f).catch(err => {
+    S.lastError = String(err.message || err);
+    msgEl.textContent = '打不开这个文件：' + (err.message || err);
+    startEl.classList.remove('hide');
+  });
+  fileInput.value = '';
+});
+
+async function openMedia(file){
+  const url = URL.createObjectURL(file);
+  msgEl.textContent = '';
+  startEl.classList.add('hide');
+
+  if (file.type.startsWith('video/')){
+    const v = document.createElement('video');
+    v.src = url; v.muted = true; v.loop = true; v.autoplay = true;
+    v.setAttribute('playsinline', '');
+    await new Promise((res, rej) => {
+      v.onloadeddata = res;
+      v.onerror = () => rej(new Error('视频解码失败，换一个 mp4 试试'));
+      setTimeout(res, 5000);          // 兜底，别卡死在等待里
+    });
+    v.play().catch(() => {});
+    S.srcEl = v; S.still = false;
+    layout();
+    if (!S.running){
+      S.running = true;
+      lastT = performance.now();
+      requestAnimationFrame(loop);
+    }
+    await ensureDetector();
+    return;
+  }
+
+  const img = new Image();
+  img.src = url;
+  await new Promise((res) => { img.onload = res; img.onerror = res; });
+  if (!img.naturalWidth) throw new Error('图片解析失败');
+
+  S.srcEl = img; S.still = true;
+  layout();
+  paint(); hud();                 // 先把图显示出来，别让用户盯着黑屏
+
+  await ensureDetector();
+  let dets = [];
+  if (S.detector){
+    try { dets = S.detector.detectForVideo(canvas, performance.now()).detections || []; }
+    catch (e){ dets = []; }
+  }
+  update(dets);
+  overlay();
+  hud();
+}
+
+/* ---------------- 诊断面板 ---------------- */
+const diagBox = document.getElementById('diagBox');
+const diagOut = document.getElementById('diagOut');
+
+function fmtRows(rows){
+  return rows.map(([k, v]) => k + ': ' + v).join('\n');
+}
+
+async function collectDiag(){
+  const rows = [];
+  rows.push(['页面地址', location.href]);
+  rows.push(['协议', location.protocol]);
+  rows.push(['安全上下文', String(window.isSecureContext)]);
+  rows.push(['getUserMedia', String(!!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia))]);
+  rows.push(['浏览器', navigator.userAgent]);
+
+  if (navigator.permissions && navigator.permissions.query){
+    try {
+      const p = await navigator.permissions.query({ name: 'camera' });
+      rows.push(['相机权限', p.state]);
+    } catch (e){
+      rows.push(['相机权限', '无法查询（' + (e.name || e.message) + '）']);
+    }
+  } else {
+    rows.push(['相机权限', '浏览器不支持查询']);
+  }
+
+  try {
+    const ds = await navigator.mediaDevices.enumerateDevices();
+    const cams = ds.filter(d => d.kind === 'videoinput');
+    rows.push(['摄像头数量', String(cams.length)]);
+    cams.forEach((c, i) => {
+      rows.push(['  设备 ' + (i + 1), c.label || '（未授权，拿不到名称）']);
+    });
+  } catch (e){
+    rows.push(['设备枚举', e.name + ': ' + e.message]);
+  }
+
+  const [sw, sh] = srcSize();
+  rows.push(['画面源', S.srcEl ? (S.srcEl === video ? '摄像头' : (S.still ? '图片' : '视频')) : '无']);
+  rows.push(['画面尺寸', `${sw}x${sh}`]);
+  rows.push(['video 元素', `readyState=${video.readyState}  ${video.videoWidth}x${video.videoHeight}`]);
+  rows.push(['画布尺寸', `${canvas.width}x${canvas.height}`]);
+  rows.push(['检测模型', S.modelState === 'ready' ? '已就绪'
+            : S.modelState === 'failed' ? '加载失败' : S.modelState]);
+  if (S.detectorLog) rows.push(['镜像日志', S.detectorLog]);
+  rows.push(['模型地址', MODEL]);
+  rows.push(['画面帧率', Math.round(S.fps) + ' fps']);
+  rows.push(['最后一次错误', S.lastError || '无']);
+  return rows;
+}
+
+document.getElementById('diag').addEventListener('click', async () => {
+  diagBox.classList.remove('hide');
+  diagOut.textContent = '正在收集…';
+  try { diagOut.textContent = fmtRows(await collectDiag()); }
+  catch (e){ diagOut.textContent = '收集失败: ' + (e.message || e); }
+});
+document.getElementById('diagClose').addEventListener('click', () => diagBox.classList.add('hide'));
+document.getElementById('diagCopy').addEventListener('click', async () => {
+  try {
+    await navigator.clipboard.writeText(diagOut.textContent);
+    toast('已复制到剪贴板');
+  } catch (e){
+    toast('复制失败，请直接截图');
+  }
+});
+
+/* ---------------- 打开即自检：页面条件不满足时直接说清楚 ---------------- */
+(function preflight(){
+  if (!window.isSecureContext || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
+    goBtn.disabled = true;
+    goBtn.textContent = '相机不可用';
+    msgEl.textContent =
+      '这个页面不是安全上下文（' + location.protocol + ' // ' + location.host + '），' +
+      '浏览器不允许调用相机。\n请用 https:// 打开，或在电脑上用 http://localhost 打开。';
+  }
+})();
+</script>
+</body>
+</html>
