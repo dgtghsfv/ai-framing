@@ -65,6 +65,28 @@
   .diagInner button{flex:1;border:0;border-radius:10px;padding:11px;font-size:14px;
     font-weight:600;font-family:inherit;background:#2a2a2a;color:#fff}
   #diagClose{background:#fff;color:#000}
+
+  /* 快门 */
+  #shutter{position:fixed;z-index:6;right:14px;top:50%;transform:translateY(-50%);
+    width:60px;height:60px;border-radius:50%;border:3px solid rgba(255,255,255,.9);
+    background:rgba(255,255,255,.16);backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);
+    padding:0;display:flex;align-items:center;justify-content:center}
+  #shutter::after{content:"";width:42px;height:42px;border-radius:50%;background:rgba(255,255,255,.92);
+    transition:transform .08s, background .08s}
+  #shutter:active::after{transform:scale(.88);background:#fca5a5}
+
+  /* 拍摄结果 */
+  #review{position:fixed;inset:0;z-index:15;background:rgba(0,0,0,.95);
+    display:flex;flex-direction:column;align-items:center;justify-content:center;
+    gap:12px;padding:20px 18px calc(env(safe-area-inset-bottom,0px) + 20px)}
+  #rvTitle{font-size:16px;font-weight:700;color:#fff;text-align:center}
+  #rvImg{max-width:100%;max-height:58vh;border-radius:10px;
+    box-shadow:0 10px 44px rgba(0,0,0,.65);-webkit-touch-callout:default}
+  .rvHint{font-size:12px;color:#8a8a8a;text-align:center}
+  .rvRow{display:flex;gap:12px;width:min(420px,100%);margin-top:4px}
+  .rvRow button{flex:1;border:0;border-radius:12px;padding:14px;font-size:16px;
+    font-weight:700;font-family:inherit;background:#2a2a2a;color:#fff}
+  #rvSave{background:#fff;color:#000}
 </style>
 </head>
 <body>
@@ -82,6 +104,7 @@
     <button data-mode="camera" class="on">移动相机</button>
     <button data-mode="subject">人物移动</button>
   </div>
+  <div class="group"><button id="sensBtn" title="灵敏度">稳</button></div>
   <div class="group"><button id="flip" title="切换前后摄像头">⇄</button></div>
   <div class="group"><button id="diag" title="诊断">?</button></div>
 </header>
@@ -93,6 +116,18 @@
 </div>
 
 <div id="toast"></div>
+
+<button id="shutter" title="拍一张并给出更好的构图"></button>
+
+<div id="review" class="hide">
+  <div id="rvTitle">建议构图</div>
+  <img id="rvImg" alt="建议构图" />
+  <div class="rvHint">长按图片可直接存进相册；或点「保存」下载</div>
+  <div class="rvRow">
+    <button id="rvDiscard">重拍</button>
+    <button id="rvSave">保存</button>
+  </div>
+</div>
 
 <div id="diagBox" class="hide">
   <div class="diagInner">
@@ -143,8 +178,19 @@ const CFG = {
   center:    { px:[0.50],     py:[0.48],     size:[0.20, 0.50] }, // 居中对称
 };
 
-const DEAD  = 0.04;   // 死区：画面比例的 4%
-const ALPHA = 0.30;   // 指数平滑系数
+// 灵敏度档位
+//   in  = 超过这个误差才开始提示
+//   out = 低于这个误差才收起提示（和 in 之间形成回差，防止临界点反复横跳）
+//   alpha = 平滑系数，越小越稳但越迟
+//   holdMs = 提示至少保持多久才允许收起
+const SENS = {
+  stable: { in: 0.085, out: 0.045, alpha: 0.14, holdMs: 1500, label: '稳' },
+  normal: { in: 0.060, out: 0.030, alpha: 0.22, holdMs: 900,  label: '中' },
+  fast:   { in: 0.040, out: 0.020, alpha: 0.30, holdMs: 450,  label: '灵' },
+};
+const SENS_ORDER = ['stable', 'normal', 'fast'];
+
+const TEXT_HOLD_MS = 380;   // 新提示要连续满足这么久才替换旧的
 
 const video  = document.getElementById('video');
 const canvas = document.getElementById('overlay');
@@ -159,6 +205,11 @@ const S = {
   srcEl:null, still:false,
   modelState:'idle', detectorLog:'',
   manual:null, drag:null,
+  reviewing:false, lastShot:null,
+  // 防抖
+  sens:'stable', alert:false, alertAt:0,
+  hintShown:'', hintCand:'', hintCandSince:0,
+  lastTx:null, lastTy:null, colorState:'',
 };
 
 // 当前画面源的像素尺寸（摄像头 / 视频 / 图片通用）
@@ -249,6 +300,7 @@ async function startCamera(){
   await waitFirstFrame(4000);
   S.srcEl = video;
   S.still = false;
+  resetGuide();
   layout();
 }
 
@@ -302,6 +354,7 @@ let lastT = performance.now();
 function loop(){
   if (!S.running) return;
   requestAnimationFrame(loop);
+  if (S.reviewing) return;        // 看回放时先别算，省电
 
   const now = performance.now();
   const dt  = now - lastT;
@@ -341,6 +394,14 @@ function update(dets){
   applyBox(box);
 }
 
+function resetGuide(){
+  S.init = false;
+  S.alert = false;
+  S.lastTx = null; S.lastTy = null;
+  S.hintShown = ''; S.hintCand = '';
+  S.colorState = '';
+}
+
 function applyBox(box){
   const W = canvas.width, H = canvas.height;
   if (!W || !H) return;
@@ -354,14 +415,22 @@ function applyBox(box){
     const cx = (box.x + box.w / 2) / W;
     const cy = (box.y + box.h / 2) / H;
 
-    // 最近的构图点
-    let best = Infinity;
+    // 最近的构图点（带迟滞：旧目标只要不比新的差太多就继续用，
+    // 否则主体停在中线附近时，目标会在左右三分点之间反复横跳）
+    let best = Infinity, bx = 0.5, by = 0.5;
     for (const px of cfg.px){
       for (const py of cfg.py){
         const dd = (px - cx) ** 2 + (py - cy) ** 2;
-        if (dd < best){ best = dd; tx = px; ty = py; }
+        if (dd < best){ best = dd; bx = px; by = py; }
       }
     }
+    if (S.lastTx !== null){
+      const dOld = Math.hypot(S.lastTx - cx, S.lastTy - cy);
+      if (dOld <= Math.sqrt(best) + 0.07){ bx = S.lastTx; by = S.lastTy; }
+    }
+    S.lastTx = bx; S.lastTy = by;
+    tx = bx; ty = by;
+
     ex = tx - cx;                 // >0：主体需要向右移
     ey = ty - cy;                 // >0：主体需要向下移
 
@@ -372,25 +441,35 @@ function applyBox(box){
   }
 
   // 指数平滑
+  const L = SENS[S.sens] || SENS.stable;
+  const a = L.alpha;
   if (!has){
     S.sx *= 0.7; S.sy *= 0.7; S.sz *= 0.7;
   } else if (!S.init){
     S.sx = ex; S.sy = ey; S.sz = es; S.init = true;
   } else {
-    S.sx = ALPHA * ex + (1 - ALPHA) * S.sx;
-    S.sy = ALPHA * ey + (1 - ALPHA) * S.sy;
-    S.sz = ALPHA * es + (1 - ALPHA) * S.sz;
+    S.sx = a * ex + (1 - a) * S.sx;
+    S.sy = a * ey + (1 - a) * S.sy;
+    S.sz = a * es + (1 - a) * S.sz;
   }
 
-  // 迟滞：连续 2 帧超死区才提示
-  const need = Math.hypot(S.sx, S.sy) > DEAD || Math.abs(S.sz) > 0.12;
-  S.cnt = need ? Math.min(S.cnt + 1, 8) : Math.max(S.cnt - 1, 0);
+  // 回差迟滞：超过 in 才亮，低于 out 且保持够久才灭
+  const now = performance.now();
+  const err = Math.hypot(S.sx, S.sy);
+  const sizeErr = Math.abs(S.sz);
+  if (!has){
+    S.alert = false;
+  } else if (!S.alert){
+    if (err > L.in || sizeErr > 0.18){ S.alert = true; S.alertAt = now; }
+  } else if (err < L.out && sizeErr < 0.10 && (now - S.alertAt) > L.holdMs){
+    S.alert = false;
+  }
 
-  const pos = Math.max(0, 1 - Math.hypot(S.sx, S.sy) / 0.30);
-  const siz = Math.max(0, 1 - Math.min(1, Math.abs(S.sz)));
+  const pos = Math.max(0, 1 - err / 0.30);
+  const siz = Math.max(0, 1 - Math.min(1, sizeErr));
 
   S.has    = has;
-  S.active = has && S.cnt >= 2;
+  S.active = has && S.alert;
   S.tx = tx; S.ty = ty;
   S.score  = has ? Math.round(100 * (0.55 * pos + 0.30 * siz + 0.15)) : NaN;
 }
@@ -453,11 +532,12 @@ function overlay(){
     ctx.restore();
   }
 
-  // 画面边框：分数越高越绿
+  // 画面边框：分数越高越绿（颜色带回差，不会在临界点闪）
   if (!isNaN(S.score)){
-    ctx.strokeStyle = S.score >= 80 ? 'rgba(74,222,128,.9)'
-                    : S.score >= 60 ? 'rgba(250,204,21,.85)'
-                    :                 'rgba(248,113,113,.85)';
+    const cs = colorState(S.score);
+    ctx.strokeStyle = cs === 'g' ? 'rgba(74,222,128,.9)'
+                    : cs === 'y' ? 'rgba(250,204,21,.85)'
+                    :              'rgba(248,113,113,.85)';
     ctx.lineWidth = 6 * u;
     ctx.strokeRect(3 * u, 3 * u, W - 6 * u, H - 6 * u);
   }
@@ -471,7 +551,10 @@ const camEl   = document.getElementById('cam');
 const barEl   = document.querySelector('#bar i');
 
 function hud(){
-  let txt, ok = false;
+  const L  = SENS[S.sens] || SENS.stable;
+  const TH = L.out;                       // 文案用较小的阈值，配合 on/off 回差
+  const now = performance.now();
+  let txt;
 
   if (S.modelState !== 'ready' && !S.has){
     txt = S.modelState === 'loading' ? '检测模型加载中…' : '拖一个框圈住主体';
@@ -479,21 +562,19 @@ function hud(){
     txt = '未检测到主体';
   } else if (!S.active){
     txt = '构图 OK';
-    ok = true;
   } else {
     const parts = [];
     const dx = S.sx, dy = S.sy;
     const cam = S.mode === 'camera';
+    const pct = v => Math.max(5, Math.round(Math.abs(v) * 20) * 5);   // 5% 一档
 
-    if (Math.abs(dx) > DEAD){
+    if (Math.abs(dx) > TH){
       parts.push((cam ? (dx > 0 ? '相机左移' : '相机右移')
-                      : (dx > 0 ? '向右移动' : '向左移动'))
-                 + ' ' + Math.round(Math.abs(dx) * 100) + '%');
+                      : (dx > 0 ? '向右移动' : '向左移动')) + ' ' + pct(dx) + '%');
     }
-    if (Math.abs(dy) > DEAD){
+    if (Math.abs(dy) > TH){
       parts.push((cam ? (dy > 0 ? '镜头抬高' : '镜头降低')
-                      : (dy > 0 ? '向下移动' : '向上移动'))
-                 + ' ' + Math.round(Math.abs(dy) * 100) + '%');
+                      : (dy > 0 ? '向下移动' : '向上移动')) + ' ' + pct(dy) + '%');
     }
     if (Math.abs(S.sz) > 0.12){
       parts.push(S.sz < 0 ? '靠近一点' : '退后一点');
@@ -501,26 +582,62 @@ function hud(){
     txt = (parts.length ? dirIcon() + ' ' : '') + parts.join(' · ');
   }
 
-  if (txt !== hintEl.textContent) hintEl.textContent = txt;
-  hintEl.classList.toggle('ok', ok);
-  hintEl.style.color = ok ? '' : (S.detector && S.has ? '#fff' : '#c9c9c9');
+  // 文字锁定：新提示要连续成立一段时间才替换，杜绝来回闪
+  if (!S.hintShown){
+    S.hintShown = txt;
+  } else if (txt !== S.hintShown){
+    if (txt !== S.hintCand){
+      S.hintCand = txt;
+      S.hintCandSince = now;
+    } else if (now - S.hintCandSince >= TEXT_HOLD_MS){
+      S.hintShown = txt;
+      S.hintCand = '';
+    }
+  } else {
+    S.hintCand = '';
+  }
 
-  const sc = isNaN(S.score) ? '--' : String(S.score);
-  if (scoreEl.textContent !== sc) scoreEl.textContent = 'SCORE ' + sc;
+  const show = S.hintShown || txt;
+  const ok = show === '构图 OK';
+  if (show !== hintEl.textContent) hintEl.textContent = show;
+  hintEl.classList.toggle('ok', ok);
+  hintEl.style.color = ok ? '' : (S.has ? '#fff' : '#c9c9c9');
+
+  // 分数按 5 分取整，别让数字一直跳
+  const scNum = isNaN(S.score) ? null : Math.floor(S.score / 5) * 5;
+  const scText = scNum === null ? 'SCORE --' : 'SCORE ' + scNum;
+  if (scoreEl.textContent !== scText) scoreEl.textContent = scText;
   fpsEl.textContent = S.still ? '' : Math.round(S.fps) + ' FPS';
 
   const [sw, sh] = srcSize();
   const kind = !sw ? '未加载画面' : (S.srcEl === video ? '相机' : (S.still ? '图片' : '视频'));
   const camTxt = sw ? `${kind} ${sw}×${sh}` : kind;
   if (camEl.textContent !== camTxt) camEl.textContent = camTxt;
-  barEl.style.width = (isNaN(S.score) ? 0 : S.score) + '%';
-  barEl.style.background = S.score >= 80 ? '#4ade80'
-                         : S.score >= 60 ? '#facc15' : '#f87171';
+
+  const cs = colorState(S.score);
+  barEl.style.width = (scNum === null ? 0 : scNum) + '%';
+  barEl.style.background = cs === 'g' ? '#4ade80' : cs === 'y' ? '#facc15' : '#f87171';
+}
+
+// 边框颜色也带 8 分回差，避免在 80 分上下反复变色
+function colorState(s){
+  if (isNaN(s)){ S.colorState = ''; return 'r'; }
+  if (!S.colorState) S.colorState = s >= 80 ? 'g' : s >= 60 ? 'y' : 'r';
+  if (S.colorState === 'g'){
+    if (s < 74) S.colorState = s >= 58 ? 'y' : 'r';
+  } else if (S.colorState === 'y'){
+    if (s >= 84) S.colorState = 'g';
+    else if (s < 54) S.colorState = 'r';
+  } else {
+    if (s >= 66) S.colorState = s >= 86 ? 'g' : 'y';
+  }
+  return S.colorState;
 }
 
 function dirIcon(){
   const ax = Math.abs(S.sx), ay = Math.abs(S.sy);
-  if (Math.max(ax, ay) <= DEAD) return '';
+  const TH = (SENS[S.sens] || SENS.stable).out;
+  if (Math.max(ax, ay) <= TH) return '';
   const cam = S.mode === 'camera';
   if (ax >= ay){
     const right = S.sx > 0;
@@ -539,11 +656,36 @@ function pick(groupId, attr, value){
 }
 document.getElementById('presetGroup').addEventListener('click', (e) => {
   const b = e.target.closest('button'); if (!b) return;
-  S.preset = b.dataset.preset; pick('presetGroup', 'preset', S.preset); S.init = false;
+  S.preset = b.dataset.preset;
+  pick('presetGroup', 'preset', S.preset);
+  resetGuide();
 });
 document.getElementById('modeGroup').addEventListener('click', (e) => {
   const b = e.target.closest('button'); if (!b) return;
   S.mode = b.dataset.mode; pick('modeGroup', 'mode', S.mode);
+});
+
+/* 灵敏度：稳 / 中 / 灵，选择会记在本地 */
+const sensBtn = document.getElementById('sensBtn');
+const SENS_LABELS = { stable: '稳（推荐）', normal: '中', fast: '灵敏' };
+
+function applySens(v){
+  if (!SENS[v]) return;
+  S.sens = v;
+  sensBtn.textContent = SENS[v].label;
+  S.hintShown = '';          // 换档后重新开始锁字
+  try { localStorage.setItem('framing.sens', v); } catch (e) {}
+}
+
+try {
+  const saved = localStorage.getItem('framing.sens');
+  if (saved && SENS[saved]) applySens(saved);
+} catch (e) {}
+
+sensBtn.addEventListener('click', () => {
+  const i = SENS_ORDER.indexOf(S.sens);
+  applySens(SENS_ORDER[(i + 1) % SENS_ORDER.length]);
+  toast('灵敏度：' + SENS_LABELS[S.sens]);
 });
 document.getElementById('flip').addEventListener('click', async () => {
   S.facing = S.facing === 'environment' ? 'user' : 'environment';
@@ -691,6 +833,7 @@ async function openMedia(file){
     });
     v.play().catch(() => {});
     S.srcEl = v; S.still = false;
+    resetGuide();
     layout();
     if (!S.running){
       S.running = true;
@@ -707,6 +850,7 @@ async function openMedia(file){
   if (!img.naturalWidth) throw new Error('图片解析失败');
 
   S.srcEl = img; S.still = true;
+  resetGuide();
   layout();
   paint(); hud();                 // 先把图显示出来，别让用户盯着黑屏
 
@@ -721,6 +865,163 @@ async function openMedia(file){
   hud();
 }
 
+/* ---------------- 拍一张，给一个更好的构图 ---------------- */
+const reviewEl  = document.getElementById('review');
+const rvTitleEl = document.getElementById('rvTitle');
+const rvImgEl   = document.getElementById('rvImg');
+
+// 在给定的裁剪范围里，这套构图能打多少分
+function cropScore(box, crop, cfg){
+  const cx = (box.x + box.w / 2 - crop.x) / crop.w;
+  const cy = (box.y + box.h / 2 - crop.y) / crop.h;
+
+  let best = Infinity, tx = 0.5, ty = 0.5;
+  for (const px of cfg.px){
+    for (const py of cfg.py){
+      const dd = (px - cx) ** 2 + (py - cy) ** 2;
+      if (dd < best){ best = dd; tx = px; ty = py; }
+    }
+  }
+  const ex = tx - cx, ey = ty - cy;
+
+  const r = box.h / crop.h;
+  const [lo, hi] = cfg.size;
+  const se = r < lo ? (r - lo) / lo : (r > hi ? (r - hi) / hi : 0);
+
+  const pos = Math.max(0, 1 - Math.hypot(ex, ey) / 0.30);
+  const siz = Math.max(0, 1 - Math.min(1, Math.abs(se)));
+  let s = 100 * (0.55 * pos + 0.30 * siz + 0.15);
+
+  // 主角被切掉就重罚
+  const inside = box.x >= crop.x - 1 && box.y >= crop.y - 1 &&
+                 box.x + box.w <= crop.x + crop.w + 1 &&
+                 box.y + box.h <= crop.y + crop.h + 1;
+  if (!inside) s -= 60;
+  return s;
+}
+
+// 搜索最合适的裁剪框：主体落在构图点上、尺寸落在区间内、不切到主体
+function bestCrop(W, H, box, cfg){
+  const aspect = W / H;
+  const ideal = (cfg.size[0] + cfg.size[1]) / 2;
+  const cx = box.x + box.w / 2, cy = box.y + box.h / 2;
+
+  let bestD = Infinity, tx = 0.5, ty = 0.5;
+  for (const px of cfg.px){
+    for (const py of cfg.py){
+      const dd = (px - cx / W) ** 2 + (py - cy / H) ** 2;
+      if (dd < bestD){ bestD = dd; tx = px; ty = py; }
+    }
+  }
+
+  const cands = [];
+  for (const k of [0.8, 0.9, 1.0, 1.1, 1.2]){
+    let ch = (box.h / ideal) * k;
+    let cw = ch * aspect;
+
+    if (cw < box.w * 1.2){ cw = box.w * 1.2; ch = cw / aspect; }
+    if (ch < box.h * 1.2){ ch = box.h * 1.2; cw = ch * aspect; }
+    if (cw > W){ cw = W; ch = cw / aspect; }
+    if (ch > H){ ch = H; cw = ch * aspect; }
+
+    let x = cx - tx * cw;
+    let y = cy - ty * ch;
+    x = Math.min(Math.max(0, x), Math.max(0, W - cw));
+    y = Math.min(Math.max(0, y), Math.max(0, H - ch));
+    cands.push({ x, y, w: cw, h: ch });
+  }
+  cands.push({ x: 0, y: 0, w: W, h: H });   // 原图也当候选，保证不会越裁越差
+
+  let bestScore = -Infinity, bestRect = cands[cands.length - 1];
+  for (const c of cands){
+    const s = cropScore(box, c, cfg);
+    if (s > bestScore){ bestScore = s; bestRect = c; }
+  }
+  return { crop: bestRect, score: bestScore };
+}
+
+function makeCropCanvas(src, crop, maxSide){
+  let w = Math.round(crop.w), h = Math.round(crop.h);
+  if (maxSide && Math.max(w, h) > maxSide){
+    const s = maxSide / Math.max(w, h);
+    w = Math.round(w * s); h = Math.round(h * s);
+  }
+  const c = document.createElement('canvas');
+  c.width = Math.max(1, w); c.height = Math.max(1, h);
+  c.getContext('2d').drawImage(src, crop.x, crop.y, crop.w, crop.h, 0, 0, c.width, c.height);
+  return c;
+}
+
+function shoot(){
+  const [W, H] = srcSize();
+  if (!W || !H){ toast('先打开相机或选一张图片'); return; }
+
+  const src = document.createElement('canvas');
+  src.width = W; src.height = H;
+  src.getContext('2d').drawImage(S.srcEl, 0, 0, W, H);
+
+  // 拍下的这一帧重新检测一次，比屏幕上的框更准
+  let box = S.bbox;
+  if (S.detector){
+    try {
+      const dets = S.detector.detectForVideo(src, performance.now()).detections || [];
+      let m = null;
+      for (const d of dets){
+        const b = d.boundingBox;
+        if (!b) continue;
+        if (!m || b.width * b.height > m.width * m.height) m = b;
+      }
+      if (m) box = { x: m.originX, y: m.originY, w: m.width, h: m.height };
+    } catch (e) {}
+  }
+  if (!box) box = S.manual;
+  if (!box){ toast('先让绿框套住主体，或在画面上拖一个框'); return; }
+
+  const cfg = CFG[S.preset];
+  const before = cropScore(box, { x: 0, y: 0, w: W, h: H }, cfg);
+  const res = bestCrop(W, H, box, cfg);
+
+  S.lastShot = { src, crop: res.crop };
+  rvImgEl.src = makeCropCanvas(src, res.crop, 1440).toDataURL('image/jpeg', 0.9);
+
+  rvTitleEl.textContent = (res.score - before > 3)
+    ? `建议构图 ${Math.round(res.score)} 分（原图 ${Math.round(before)} 分）`
+    : `这张已经挺好了（${Math.round(before)} 分）`;
+
+  S.reviewing = true;
+  reviewEl.classList.remove('hide');
+}
+
+function closeReview(){
+  S.reviewing = false;
+  reviewEl.classList.add('hide');
+  rvImgEl.removeAttribute('src');
+}
+
+function saveShot(){
+  const shot = S.lastShot;
+  if (!shot) return;
+  const out = makeCropCanvas(shot.src, shot.crop, 0);
+  out.toBlob((blob) => {
+    if (!blob){ toast('导出失败'); return; }
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    const t = new Date(), p = n => String(n).padStart(2, '0');
+    a.download = `framing_${t.getFullYear()}${p(t.getMonth() + 1)}${p(t.getDate())}_` +
+                 `${p(t.getHours())}${p(t.getMinutes())}${p(t.getSeconds())}.jpg`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+  }, 'image/jpeg', 0.92);
+  toast('已保存');
+  closeReview();
+}
+
+document.getElementById('shutter').addEventListener('click', shoot);
+document.getElementById('rvSave').addEventListener('click', saveShot);
+document.getElementById('rvDiscard').addEventListener('click', closeReview);
+
 /* ---------------- 诊断面板 ---------------- */
 const diagBox = document.getElementById('diagBox');
 const diagOut = document.getElementById('diagOut');
@@ -731,6 +1032,8 @@ function fmtRows(rows){
 
 async function collectDiag(){
   const rows = [];
+  rows.push(['页面版本', 'v3 快门裁切']);
+  rows.push(['灵敏度', S.sens]);
   rows.push(['页面地址', location.href]);
   rows.push(['协议', location.protocol]);
   rows.push(['安全上下文', String(window.isSecureContext)]);
